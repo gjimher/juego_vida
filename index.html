@@ -1,0 +1,375 @@
+splay: block; margin: 0 auto; background-color: black; }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+  <script>
+    // ================================
+    // Constantes y parámetros
+    // ================================
+    const CELL_SIZE = 5;                // Cada celda mide 5x5 píxeles
+    const GRID_WIDTH = 120;             // 120 celdas en horizontal
+    const GRID_HEIGHT = 120;            // 120 celdas en vertical
+    const SCREEN_WIDTH = GRID_WIDTH * CELL_SIZE;   // 600 píxeles de ancho
+    const SCREEN_HEIGHT = GRID_HEIGHT * CELL_SIZE; // 600 píxeles de alto
+    const FPS = 40;                     // 40 frames por segundo
+    const SCOREBOARD_HEIGHT = 30;       // Zona para el marcador
+
+    const SHIELD_DURATION = 200;        // Duración del escudo en frames (5 seg a 40 FPS)
+    const SHIELD_RADIUS = 5;            // Radio del escudo (en celdas)
+
+    const MIN_SPACESHIP_Y = Math.floor(0.75 * GRID_HEIGHT);  // Ej: fila 90
+    const MAX_SPACESHIP_Y = GRID_HEIGHT - 1;                 // Última fila (119)
+
+    // ================================
+    // Patrones de disparo (offsets)
+    // ================================
+    const gliderUpLeftOffsets = [[0,0],[-1,0],[-2,0],[-2,1],[-1,2]];
+    const gliderUpRightOffsets = [[0,0],[0,1],[0,2],[1,2],[2,1]];
+    // LWSS orientado hacia arriba (resultado de rotar 90° antihorario la forma estándar)
+    const lwssUpOffsets = [[3,0],[2,0],[1,0],[0,0],[4,1],[0,1],[0,2],[4,3],[1,3]];
+
+    // ================================
+    // Variables de estado global
+    // ================================
+    let state = "intro";  // "intro", "playing" o "gameover"
+    let highscore = 0;
+    let phase = 0;
+    let grid = [];
+    let spaceship_x = Math.floor(GRID_WIDTH/2);
+    let spaceship_y = MAX_SPACESHIP_Y;
+    let shield_count = 1;
+    let shield_active = false;
+    let shield_timer = 0;
+    let phase_message = "";
+    let phase_message_timer = 0;
+    let gameOverTimer = 0;
+
+    const keysPressed = {};
+
+    // ================================
+    // Configuración del canvas
+    // ================================
+    const canvas = document.getElementById("gameCanvas");
+    canvas.width = SCREEN_WIDTH;
+    canvas.height = SCREEN_HEIGHT;
+    const ctx = canvas.getContext("2d");
+
+    // ================================
+    // Funciones del juego
+    // ================================
+
+    // Inicializa el grid según la fase
+    function initializeGridPhase(phase) {
+      let grid = [];
+      for (let i = 0; i < GRID_HEIGHT; i++) {
+        grid.push(new Array(GRID_WIDTH).fill(0));
+      }
+      let top_percent = Math.max(0, 25 - phase);
+      let bottom_percent = Math.min(100, 75 + phase);
+      let start_row = Math.floor(top_percent / 100 * GRID_HEIGHT);
+      let end_row = Math.floor(bottom_percent / 100 * GRID_HEIGHT);
+      if (end_row > GRID_HEIGHT - 1) {
+        end_row = GRID_HEIGHT - 1;
+      }
+      const prob_viva = 0.2;
+      for (let i = start_row; i < end_row; i++) {
+        for (let j = 0; j < GRID_WIDTH; j++) {
+          grid[i][j] = (Math.random() < prob_viva) ? 1 : 0;
+        }
+      }
+      return grid;
+    }
+
+    // Actualiza el grid aplicando las reglas del Juego de la Vida (contorno toroide)
+    function updateGrid(oldGrid) {
+      let newGrid = [];
+      for (let i = 0; i < GRID_HEIGHT; i++) {
+        newGrid.push(new Array(GRID_WIDTH).fill(0));
+      }
+      for (let i = 0; i < GRID_HEIGHT; i++) {
+        for (let j = 0; j < GRID_WIDTH; j++) {
+          let neighbors = 0;
+          for (let di = -1; di <= 1; di++) {
+            for (let dj = -1; dj <= 1; dj++) {
+              if (di === 0 && dj === 0) continue;
+              let ni = (i + di + GRID_HEIGHT) % GRID_HEIGHT;
+              let nj = (j + dj + GRID_WIDTH) % GRID_WIDTH;
+              neighbors += oldGrid[ni][nj];
+            }
+          }
+          if (oldGrid[i][j] === 1 && (neighbors === 2 || neighbors === 3)) {
+            newGrid[i][j] = 1;
+          } else if (oldGrid[i][j] === 0 && neighbors === 3) {
+            newGrid[i][j] = 1;
+          } else {
+            newGrid[i][j] = 0;
+          }
+        }
+      }
+      return newGrid;
+    }
+
+    // Lanza un patrón (disparo) a partir de la posición de la nave
+    function launchPattern(grid, spaceship_x, spaceship_y, pattern, vertical_offset, horizontal_offset) {
+      const insertion_row = spaceship_y - vertical_offset;
+      const insertion_col = (spaceship_x - horizontal_offset + GRID_WIDTH) % GRID_WIDTH;
+      pattern.forEach(offset => {
+        let r = insertion_row + offset[0];
+        let c = (insertion_col + offset[1] + GRID_WIDTH) % GRID_WIDTH;
+        if (r >= 0 && r < GRID_HEIGHT) {
+          grid[r][c] = 1;
+        }
+      });
+    }
+
+    // Dibuja el grid (celdas vivas en blanco)
+    function drawGrid() {
+      ctx.fillStyle = "black";
+      ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+      ctx.fillStyle = "white";
+      for (let i = 0; i < GRID_HEIGHT; i++) {
+        for (let j = 0; j < GRID_WIDTH; j++) {
+          if (grid[i][j] === 1) {
+            ctx.fillRect(j * CELL_SIZE, i * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+          }
+        }
+      }
+    }
+
+    // Dibuja la nave (3 celdas rojas)
+    function drawSpaceship() {
+      ctx.fillStyle = "red";
+      for (let dx = -1; dx <= 1; dx++) {
+        const x = (spaceship_x + dx + GRID_WIDTH) % GRID_WIDTH;
+        ctx.fillRect(x * CELL_SIZE, spaceship_y * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+      }
+    }
+
+    // Dibuja el escudo circular alrededor de la nave
+    function drawShield() {
+      const centerX = spaceship_x * CELL_SIZE + CELL_SIZE / 2;
+      const centerY = spaceship_y * CELL_SIZE + CELL_SIZE / 2;
+      ctx.strokeStyle = "cyan";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(centerX, centerY, SHIELD_RADIUS * CELL_SIZE, 0, 2 * Math.PI);
+      ctx.stroke();
+    }
+
+    // Comprueba colisiones: si alguna celda bajo la nave (3 celdas) está viva
+    function checkCollision() {
+      if (shield_active) return false;
+      for (let dx = -1; dx <= 1; dx++) {
+        const x = (spaceship_x + dx + GRID_WIDTH) % GRID_WIDTH;
+        if (grid[spaceship_y][x] === 1) return true;
+      }
+      return false;
+    }
+
+    // Dibuja el marcador (scoreboard) con contorno
+    function drawScoreboard() {
+      ctx.font = "20px Arial";
+      ctx.textBaseline = "top";
+      let liveCount = 0;
+      for (let i = 0; i < GRID_HEIGHT; i++) {
+        for (let j = 0; j < GRID_WIDTH; j++) {
+          if (grid[i][j] === 1) liveCount++;
+        }
+      }
+      const totalCells = GRID_WIDTH * GRID_HEIGHT;
+      const deadCount = totalCells - liveCount;
+      const livePercent = ((liveCount / totalCells) * 100).toFixed(2);
+      const text = `Fase: ${phase}    Muertas: ${deadCount}    % Vivas: ${livePercent}%    Escudos: ${shield_count}`;
+      // Dibuja contorno dibujando el texto offset en 8 direcciones
+      ctx.fillStyle = "black";
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          if (dx !== 0 || dy !== 0) {
+            ctx.fillText(text, 10 + dx, 10 + dy);
+          }
+        }
+      }
+      ctx.fillStyle = "white";
+      ctx.fillText(text, 10, 10);
+    }
+
+    // Muestra mensaje de cambio de fase (durante un tiempo)
+    function drawPhaseMessage() {
+      if (phase_message_timer > 0) {
+        ctx.font = "36px Arial";
+        ctx.textAlign = "center";
+        ctx.fillStyle = "green";
+        ctx.fillText(phase_message, SCREEN_WIDTH / 2, SCOREBOARD_HEIGHT + 30);
+      }
+    }
+
+    // Dibuja "Game Over" en el centro
+    function drawGameOver() {
+      ctx.font = "36px Arial";
+      ctx.textAlign = "center";
+      ctx.fillStyle = "red";
+      ctx.fillText("Game Over", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
+    }
+
+    // Pantalla de introducción con instrucciones y highscore
+    function drawIntroScreen() {
+      ctx.fillStyle = "black";
+      ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+      ctx.font = "36px Arial";
+      ctx.textAlign = "center";
+      ctx.fillStyle = "yellow";
+      ctx.fillText("Juego de la Vida y Galaxian", SCREEN_WIDTH / 2, 50);
+      ctx.font = "20px Arial";
+      ctx.textAlign = "left";
+      const instructions = [
+        "Flechas: mover la nave",
+        "A: Disparo glider izquierda",
+        "D: Disparo glider derecha",
+        "S: Disparo LWSS",
+        "Espacio: Activar escudo (5 seg, desactiva celdas y evita colisiones)",
+        "N: Iniciar partida / Nueva partida"
+      ];
+      let y = 100;
+      instructions.forEach(line => {
+        ctx.fillStyle = "white";
+        ctx.fillText(line, 50, y);
+        y += 30;
+      });
+      ctx.fillStyle = "white";
+      ctx.fillText(`Highscore (mayor fase alcanzada): ${highscore}`, 50, y + 20);
+      ctx.fillStyle = "lime";
+      ctx.fillText("Presiona N para comenzar", 50, SCREEN_HEIGHT - 50);
+    }
+
+    // ================================
+    // Bucle principal del juego
+    // ================================
+    function gameLoop() {
+      if (state === "intro") {
+        drawIntroScreen();
+      } else if (state === "playing") {
+        // Movimiento de la nave según las teclas pulsadas
+        if (keysPressed["ArrowLeft"]) {
+          spaceship_x = (spaceship_x - 1 + GRID_WIDTH) % GRID_WIDTH;
+        }
+        if (keysPressed["ArrowRight"]) {
+          spaceship_x = (spaceship_x + 1) % GRID_WIDTH;
+        }
+        if (keysPressed["ArrowUp"] && spaceship_y > MIN_SPACESHIP_Y) {
+          spaceship_y -= 1;
+        }
+        if (keysPressed["ArrowDown"] && spaceship_y < MAX_SPACESHIP_Y) {
+          spaceship_y += 1;
+        }
+
+        // Actualiza el grid con las reglas del Juego de la Vida
+        grid = updateGrid(grid);
+
+        // Si el escudo está activo, desactiva las células en su área
+        if (shield_active) {
+          for (let i = spaceship_y - SHIELD_RADIUS; i <= spaceship_y + SHIELD_RADIUS; i++) {
+            for (let j = spaceship_x - SHIELD_RADIUS; j <= spaceship_x + SHIELD_RADIUS; j++) {
+              const ii = (i + GRID_HEIGHT) % GRID_HEIGHT;
+              const jj = (j + GRID_WIDTH) % GRID_WIDTH;
+              if (Math.pow(i - spaceship_y, 2) + Math.pow(j - spaceship_x, 2) <= Math.pow(SHIELD_RADIUS, 2)) {
+                grid[ii][jj] = 0;
+              }
+            }
+          }
+          shield_timer--;
+          if (shield_timer <= 0) shield_active = false;
+        }
+
+        // Comprueba colisión de la nave (si alguna celda ocupada está viva)
+        if (checkCollision()) {
+          state = "gameover";
+          gameOverTimer = 80; // 2 segundos a 40 FPS
+          if (phase > highscore) highscore = phase;
+        }
+
+        // Cálculo de estadísticas y cambio de fase
+        let liveCount = 0;
+        for (let i = 0; i < GRID_HEIGHT; i++) {
+          for (let j = 0; j < GRID_WIDTH; j++) {
+            if (grid[i][j] === 1) liveCount++;
+          }
+        }
+        const totalCells = GRID_WIDTH * GRID_HEIGHT;
+        const livePercent = (liveCount / totalCells) * 100;
+        if (livePercent < 2) {
+          phase++;
+          grid = initializeGridPhase(phase);
+          phase_message = `¡Cambio de fase a ${phase}!`;
+          phase_message_timer = 120;
+          shield_count++;
+        }
+
+        // Dibuja los elementos del juego
+        drawGrid();
+        drawSpaceship();
+        if (shield_active) drawShield();
+        drawScoreboard();
+        drawPhaseMessage();
+
+      } else if (state === "gameover") {
+        // Muestra "Game Over" durante 2 segundos y luego vuelve a la pantalla principal
+        drawGrid();
+        drawSpaceship();
+        if (shield_active) drawShield();
+        drawGameOver();
+        gameOverTimer--;
+        if (gameOverTimer <= 0) {
+          state = "intro";
+        }
+      }
+
+      // Solicita el siguiente frame
+      setTimeout(gameLoop, 1000 / FPS);
+    }
+
+    // ================================
+    // Eventos de teclado
+    // ================================
+    window.addEventListener("keydown", function(e) {
+      keysPressed[e.key] = true;
+      if (state === "intro" && e.key.toLowerCase() === "n") {
+        state = "playing";
+        phase = 0;
+        grid = initializeGridPhase(phase);
+        spaceship_x = Math.floor(GRID_WIDTH/2);
+        spaceship_y = MAX_SPACESHIP_Y;
+        shield_count = 1;
+        shield_active = false;
+        shield_timer = 0;
+        phase_message = "";
+        phase_message_timer = 0;
+      }
+      if (state === "playing") {
+        if (e.key.toLowerCase() === "a") {
+          launchPattern(grid, spaceship_x, spaceship_y, gliderUpLeftOffsets, 1, 0);
+        } else if (e.key.toLowerCase() === "d") {
+          launchPattern(grid, spaceship_x, spaceship_y, gliderUpRightOffsets, 2, 1);
+        } else if (e.key.toLowerCase() === "s") {
+          launchPattern(grid, spaceship_x, spaceship_y, lwssUpOffsets, 4, 1);
+        } else if (e.key === " ") {
+          if (!shield_active && shield_count > 0) {
+            shield_active = true;
+            shield_timer = SHIELD_DURATION;
+            shield_count--;
+          }
+        }
+      }
+    });
+
+    window.addEventListener("keyup", function(e) {
+      keysPressed[e.key] = false;
+    });
+
+    // ================================
+    // Inicia el bucle principal
+    // ================================
+    gameLoop();
+  </script>
+</body>
+</html>
